@@ -1,10 +1,11 @@
 use async_channel::{Receiver, Recv, Sender};
 
 use futures::{
+    future::Pending,
     io::{AsyncRead, AsyncWrite},
     FutureExt,
 };
-use std::{future::Future, io::Write, pin::Pin, task::Poll};
+use std::{cmp::Ordering, future::Future, io::Write, pin::Pin, task::Poll};
 
 pub struct ChannelWriter(pub Sender<Vec<u8>>);
 
@@ -40,7 +41,7 @@ impl AsyncWrite for ChannelWriter {
 
 pub struct ChannelReader {
     recv: Pin<Box<Receiver<Vec<u8>>>>,
-    fut: Option<Pin<Box<Recv<'static, Vec<u8>>>>>,
+    data: ChannelReaderData,
 }
 
 enum ChannelReaderData {
@@ -54,12 +55,39 @@ enum ChannelReaderData {
     Pending(Pin<Box<Recv<'static, Vec<u8>>>>),
 }
 
+impl ChannelReaderData {
+    pub fn take(&mut self) -> Self {
+        std::mem::replace(self, Self::None)
+    }
+}
+
 impl ChannelReader {
     pub fn new(recv: Receiver<Vec<u8>>) -> Self {
         Self {
             recv: Box::pin(recv),
-            fut: None,
+            data: ChannelReaderData::None,
         }
+    }
+
+    fn try_write(&mut self, mut to_write: Vec<u8>, mut buf: &mut [u8]) -> std::io::Result<usize> {
+        let amount_written = buf.write(&to_write)?;
+        match amount_written.cmp(&to_write.len()) {
+            // We read everything from the vec into the buffer
+            // We can now set self.data to None
+            Ordering::Equal => self.data = ChannelReaderData::None,
+            // We filled the buffer but did not read all of vec
+            Ordering::Less => {
+                // FIXME: this drain copies all elements. Might be a botleneck
+                // consider vecdeque over vec for this impl
+                // another option is to store a counter of amount written and slice &to_write with it (probably most performant?)
+                to_write.drain(0..amount_written);
+                self.data = ChannelReaderData::Some(to_write);
+            }
+            Ordering::Greater => {
+                unreachable!("Somehow we read more data from the vector that the vector contains!")
+            }
+        }
+        Ok(amount_written)
     }
 }
 
@@ -69,38 +97,42 @@ impl AsyncRead for ChannelReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        mut buf: &mut [u8],
+        buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let mut fut = self.fut.take().unwrap_or_else(|| {
-            // SAFETY: Lmao probably not
-            // but in reality this holds a reference to self.recv so as long we don't
-            // leak fut or recv this "'static" should be valid.
-            // must make sure we have self.recv pinned so the memory reference is valid
-            let fut: Recv<'static, Vec<u8>> = unsafe { std::mem::transmute(self.recv.recv()) };
-            Box::pin(fut)
-        });
+        let mut fut = match self.data.take() {
+            ChannelReaderData::Some(data) => {
+                // here we will read as much as we can to buffer and
+                // then either set data to remaining data or none
+                return Poll::Ready(self.try_write(data, buf));
+            }
+            ChannelReaderData::None => {
+                // Time to ask for more data from the channel
 
-        let recieved_bytes = match fut.poll_unpin(cx) {
+                // SAFETY: Lmao probably not
+                // but in reality this holds a reference to self.recv so as long we don't
+                // leak fut or recv this "'static" should be valid.
+                // must make sure we have self.recv pinned so the memory reference is valid
+                let fut: Recv<'static, Vec<u8>> = unsafe { std::mem::transmute(self.recv.recv()) };
+                Box::pin(fut)
+            }
+            ChannelReaderData::Pending(fut) => fut,
+        };
+
+        let received_result = match fut.poll_unpin(cx) {
             Poll::Pending => {
-                self.fut = Some(fut);
+                self.data = ChannelReaderData::Pending(fut);
                 return Poll::Pending;
             }
             Poll::Ready(bytes) => bytes,
         };
 
-        let res = match recieved_bytes {
-            Ok(val) => {
-                // TODO: what about if buf is shorter than received bytes?
-                // we will need to store the bytes we have not yet read into self to read later
-                buf.write(&val)
-            }
+        let Ok(bytes) = received_result else {
             // Error can only mean channel is closed so we will return 0 bytes read.
             // 0 Bytes read means EOF
-            Err(_) => Ok(0),
-
+            return Poll::Ready(Ok(0));
         };
 
-        Poll::Ready(res)
+        Poll::Ready(self.try_write(bytes, buf))
     }
 }
 
@@ -130,13 +162,12 @@ mod test {
         let mut read = String::from_utf8_lossy(&buf[..5]).to_string();
 
         assert_eq!("hello", read);
-        
+
         async_reader.read(&mut buf).await;
         let read2 = String::from_utf8_lossy(&buf[..6]).to_string();
         read.push_str(&read2);
         assert_eq!("hello world", read);
     }
-
 
     #[tokio::test]
     async fn test_reader_exact() {
@@ -183,6 +214,4 @@ mod test {
         }
         assert_eq!("Hello World!", read);
     }
-
-
 }
