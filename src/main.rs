@@ -1,1 +1,1 @@
-use futures::io::AsyncReadExt;
+fn main() {}

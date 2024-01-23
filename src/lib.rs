@@ -1,27 +1,64 @@
 use async_channel::{Receiver, Recv, Sender};
 
 use futures::{
-    future::Pending,
     io::{AsyncRead, AsyncWrite},
     FutureExt,
 };
-use std::{cmp::Ordering, future::Future, io::Write, pin::Pin, task::Poll};
+use std::{cmp::Ordering, io::Write, pin::Pin, task::Poll};
 
-pub struct ChannelWriter(pub Sender<Vec<u8>>);
+pub fn pipe() -> (ChannelWriter, ChannelReader) {
+    let (sender, recv) = async_channel::unbounded();
+    (ChannelWriter::new(sender), ChannelReader::new(recv))
+}
+
+pub struct ChannelWriter(Sender<Vec<u8>>);
+
+impl ChannelWriter {
+    /// This current implementation uses [`send_blocking`] so it is
+    /// very imporant that this only is an unbounded sender
+    ///
+    /// [`send_blocking`]: https://docs.rs/async-channel/latest/async_channel/struct.Sender.html#method.send_blocking
+    ///
+    /// ## Example
+    /// ```
+    /// use tokio::time;
+    /// use channel_io::ChannelWriter;
+    /// use futures::AsyncWriteExt;
+    ///
+    /// async fn example() {
+    ///     let (send, recv) = async_channel::unbounded();
+    ///     let mut async_writer = ChannelWriter::new(send);
+    ///
+    ///     async_writer.write(b"Hello").await.unwrap();
+    ///     tokio::spawn(async move {
+    ///         time::sleep(time::Duration::from_millis(50)).await;
+    ///         async_writer.write(b" World!").await.unwrap();
+    ///     });
+    ///
+    ///     let mut message = String::new();
+    ///
+    ///     while let Ok(received) = recv.recv().await {
+    ///         message.push_str(std::str::from_utf8(&received).unwrap())
+    ///     };
+    ///     assert_eq!(message, "Hello World!")
+    /// }
+    /// ```
+    pub fn new(sender: Sender<Vec<u8>>) -> Self {
+        Self(sender)
+    }
+}
 
 impl AsyncWrite for ChannelWriter {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let msg = Vec::from(buf);
         let amount_written = msg.len();
-        // TODO: this is most certainly wrong. I should not make a new send future each time
-        std::pin::pin!(self.0.send(msg))
-            .poll(cx)
-            .map_ok(|_| amount_written)
-            .map_err(|send_err| std::io::Error::new(std::io::ErrorKind::Other, send_err))
+        futures::executor::block_on(self.0.send(msg)).unwrap();
+        // self.0.send_blocking(msg).unwrap(); //TODO: what do we do if the channel is closed?
+        Poll::Ready(Ok(amount_written))
     }
 
     fn poll_flush(
@@ -47,7 +84,7 @@ pub struct ChannelReader {
 enum ChannelReaderData {
     /// We have no data in buffer and we have not asked for any
     None,
-    /// We have data to give but no body as asked for it yet.
+    /// We have data to give but nobody as asked for it yet.
     /// This will happen if we receive a value from pending but
     /// The buffer we write to is not long enough to receive it all
     Some(Vec<u8>),
@@ -84,7 +121,7 @@ impl ChannelReader {
                 self.data = ChannelReaderData::Some(to_write);
             }
             Ordering::Greater => {
-                unreachable!("Somehow we read more data from the vector that the vector contains!")
+                unreachable!("Somehow we read more data from the vector than the vector contains!")
             }
         }
         Ok(amount_written)
@@ -136,10 +173,11 @@ impl AsyncRead for ChannelReader {
     }
 }
 
+#[allow(clippy::unused_io_amount)]
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::io::AsyncReadExt;
+    use futures::{AsyncReadExt, AsyncWriteExt};
     use tokio::time;
 
     #[tokio::test]
@@ -157,13 +195,13 @@ mod test {
         });
         let mut buf = vec![0; 100];
 
-        async_reader.read(&mut buf).await;
+        async_reader.read(&mut buf).await.unwrap();
 
         let mut read = String::from_utf8_lossy(&buf[..5]).to_string();
 
         assert_eq!("hello", read);
 
-        async_reader.read(&mut buf).await;
+        async_reader.read(&mut buf).await.unwrap();
         let read2 = String::from_utf8_lossy(&buf[..6]).to_string();
         read.push_str(&read2);
         assert_eq!("hello world", read);
@@ -213,5 +251,24 @@ mod test {
             read.push_str(std::str::from_utf8(&buf).unwrap());
         }
         assert_eq!("Hello World!", read);
+    }
+
+    #[tokio::test]
+    async fn test_write_simple() {
+        let (send, recv) = async_channel::unbounded();
+        let mut async_writer = ChannelWriter::new(send);
+
+        async_writer.write(b"Hello").await.unwrap();
+        tokio::spawn(async move {
+            time::sleep(time::Duration::from_millis(50)).await;
+            async_writer.write(b" World!").await.unwrap();
+        });
+
+        let mut message = String::new();
+
+        while let Ok(received) = recv.recv().await {
+            message.push_str(std::str::from_utf8(&received).unwrap())
+        }
+        assert_eq!(message, "Hello World!")
     }
 }
