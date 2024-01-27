@@ -1,4 +1,4 @@
-use async_channel::{Receiver, Recv, Sender};
+use async_channel::{Receiver, Recv, Send, Sender};
 
 use futures::{
     io::{AsyncRead, AsyncWrite},
@@ -11,61 +11,64 @@ pub fn pipe() -> (ChannelWriter, ChannelReader) {
     (ChannelWriter::new(sender), ChannelReader::new(recv))
 }
 
-pub struct ChannelWriter(Sender<Vec<u8>>);
+pub struct ChannelWriter {
+    channel: Pin<Box<Sender<Vec<u8>>>>,
+    fut: Option<Pin<Box<Send<'static, Vec<u8>>>>>,
+}
 
 impl ChannelWriter {
-    /// This current implementation uses [`send_blocking`] so it is
-    /// very imporant that this only is an unbounded sender
-    ///
-    /// [`send_blocking`]: https://docs.rs/async-channel/latest/async_channel/struct.Sender.html#method.send_blocking
-    ///
-    /// ## Example
-    /// ```
-    /// use tokio::time;
-    /// use channel_io::ChannelWriter;
-    /// use futures::AsyncWriteExt;
-    ///
-    /// async fn example() {
-    ///     let (send, recv) = async_channel::unbounded();
-    ///     let mut async_writer = ChannelWriter::new(send);
-    ///
-    ///     async_writer.write(b"Hello").await.unwrap();
-    ///     tokio::spawn(async move {
-    ///         time::sleep(time::Duration::from_millis(50)).await;
-    ///         async_writer.write(b" World!").await.unwrap();
-    ///     });
-    ///
-    ///     let mut message = String::new();
-    ///
-    ///     while let Ok(received) = recv.recv().await {
-    ///         message.push_str(std::str::from_utf8(&received).unwrap())
-    ///     };
-    ///     assert_eq!(message, "Hello World!")
-    /// }
-    /// ```
     pub fn new(sender: Sender<Vec<u8>>) -> Self {
-        Self(sender)
+        Self {
+            channel: Box::pin(sender),
+            fut: None,
+        }
     }
 }
 
 impl AsyncWrite for ChannelWriter {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        if let Some(mut fut) = self.fut.take() {
+            // If the future is still pending then we cannot accept more data
+            let Poll::Ready(send_res) = fut.poll_unpin(cx) else {
+                self.fut = Some(fut);
+                return Poll::Pending;
+            };
+            if let Err(_e) = send_res {
+                // poll ready 0 means the channel is closed
+                return Poll::Ready(Ok(0));
+            }
+        }
+        // Here Either the future was completed or we had not future to begin with so we can accept the data
         let msg = Vec::from(buf);
         let amount_written = msg.len();
-        futures::executor::block_on(self.0.send(msg)).unwrap();
-        // self.0.send_blocking(msg).unwrap(); //TODO: what do we do if the channel is closed?
+        let fut: Send<'static, Vec<u8>> = unsafe { std::mem::transmute(self.channel.send(msg)) };
+        let mut fut = Box::pin(fut);
+
+        // if we cannot immediately send then we store the future for later
+        if fut.poll_unpin(cx).is_pending() {
+            self.fut = Some(fut);
+        }
+
         Poll::Ready(Ok(amount_written))
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
+        println!("Polling Flush");
+        self.fut
+            .as_mut()
+            // if there is a future we need to poll it to try and keep writing
+            .map(|fut| fut.poll_unpin(cx))
+            // if there is no future then its okay there is nothing to flush
+            .unwrap_or_else(|| Poll::Ready(Ok(())))
+            // if the channel had an error we don't care. We count this as a flush
+            .map(|_| Ok(()))
     }
 
     fn poll_close(
@@ -246,7 +249,6 @@ mod test {
         let mut buf = vec![0; 2];
         let mut read = String::new();
         while read.len() < 12 {
-            println!("{read}");
             async_reader.read_exact(&mut buf).await.unwrap();
             read.push_str(std::str::from_utf8(&buf).unwrap());
         }
