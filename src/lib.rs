@@ -31,22 +31,28 @@ impl AsyncWrite for ChannelWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        log::trace!("Polling Write");
         if let Some(mut fut) = self.fut.take() {
+            log::trace!("Previous Send Found");
             // If the future is still pending then we cannot accept more data
             let Poll::Ready(send_res) = fut.poll_unpin(cx) else {
+                log::trace!("Previous Send Still pending");
                 self.fut = Some(fut);
                 return Poll::Pending;
             };
             if let Err(_e) = send_res {
                 // poll ready 0 means the channel is closed
+                log::trace!("Sender Error. Returning EOF");
                 return Poll::Ready(Ok(0));
             }
         }
-        // Here Either the future was completed or we had not future to begin with so we can accept the data
+        // Here Either the future was completed or we had no future to begin with so we can accept the data
         let msg = Vec::from(buf);
         let amount_written = msg.len();
         let fut: Send<'static, Vec<u8>> = unsafe { std::mem::transmute(self.channel.send(msg)) };
         let mut fut = Box::pin(fut);
+
+        log::trace!("Sent {amount_written} bytes");
 
         // if we cannot immediately send then we store the future for later
         if fut.poll_unpin(cx).is_pending() {
@@ -60,7 +66,7 @@ impl AsyncWrite for ChannelWriter {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        println!("Polling Flush");
+        log::trace!("Polling Flush");
         self.fut
             .as_mut()
             // if there is a future we need to poll it to try and keep writing
@@ -75,6 +81,7 @@ impl AsyncWrite for ChannelWriter {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        log::trace!("Polling Close");
         std::task::Poll::Ready(Ok(()))
     }
 }
@@ -111,6 +118,7 @@ impl ChannelReader {
 
     fn try_write(&mut self, mut to_write: Vec<u8>, mut buf: &mut [u8]) -> std::io::Result<usize> {
         let amount_written = buf.write(&to_write)?;
+        log::trace!("Read {amount_written} bytes");
         match amount_written.cmp(&to_write.len()) {
             // We read everything from the vec into the buffer
             // We can now set self.data to None
@@ -139,10 +147,12 @@ impl AsyncRead for ChannelReader {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
+        log::trace!("Polling read");
         let mut fut = match self.data.take() {
             ChannelReaderData::Some(data) => {
                 // here we will read as much as we can to buffer and
                 // then either set data to remaining data or none
+                log::trace!("Data Already Here");
                 return Poll::Ready(self.try_write(data, buf));
             }
             ChannelReaderData::None => {
@@ -152,6 +162,7 @@ impl AsyncRead for ChannelReader {
                 // but in reality this holds a reference to self.recv so as long we don't
                 // leak fut or recv this "'static" should be valid.
                 // must make sure we have self.recv pinned so the memory reference is valid
+                log::trace!("Making New Recv future");
                 let fut: Recv<'static, Vec<u8>> = unsafe { std::mem::transmute(self.recv.recv()) };
                 Box::pin(fut)
             }
@@ -161,6 +172,7 @@ impl AsyncRead for ChannelReader {
         let received_result = match fut.poll_unpin(cx) {
             Poll::Pending => {
                 self.data = ChannelReaderData::Pending(fut);
+                log::trace!("Receiver is still pending");
                 return Poll::Pending;
             }
             Poll::Ready(bytes) => bytes,
@@ -169,8 +181,11 @@ impl AsyncRead for ChannelReader {
         let Ok(bytes) = received_result else {
             // Error can only mean channel is closed so we will return 0 bytes read.
             // 0 Bytes read means EOF
+            log::trace!("Receiver Error. Returning EOF");
             return Poll::Ready(Ok(0));
         };
+
+        log::trace!("Received {} bytes", bytes.len());
 
         Poll::Ready(self.try_write(bytes, buf))
     }
@@ -264,6 +279,31 @@ mod test {
         tokio::spawn(async move {
             time::sleep(time::Duration::from_millis(50)).await;
             async_writer.write(b" World!").await.unwrap();
+        });
+
+        let mut message = String::new();
+
+        while let Ok(received) = recv.recv().await {
+            message.push_str(std::str::from_utf8(&received).unwrap())
+        }
+        assert_eq!(message, "Hello World!")
+    }
+
+
+    #[tokio::test]
+    async fn test_write_flush() {
+        let (send, recv) = async_channel::unbounded();
+        let mut async_writer = ChannelWriter::new(send);
+
+        async_writer.write(b"Hello").await.unwrap();
+        tokio::spawn(async move {
+            time::sleep(time::Duration::from_millis(50)).await;
+            async_writer.flush().await.unwrap();
+            async_writer.flush().await.unwrap();
+            async_writer.write(b" World!").await.unwrap();
+            async_writer.flush().await.unwrap();
+            async_writer.flush().await.unwrap();
+            async_writer.flush().await.unwrap();
         });
 
         let mut message = String::new();
