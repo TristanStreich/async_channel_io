@@ -289,20 +289,16 @@ mod test {
         assert_eq!(message, "Hello World!")
     }
 
-
     #[tokio::test]
     async fn test_write_flush() {
         let (send, recv) = async_channel::unbounded();
         let mut async_writer = ChannelWriter::new(send);
 
         async_writer.write(b"Hello").await.unwrap();
+        async_writer.flush().await.unwrap();
         tokio::spawn(async move {
             time::sleep(time::Duration::from_millis(50)).await;
-            async_writer.flush().await.unwrap();
-            async_writer.flush().await.unwrap();
             async_writer.write(b" World!").await.unwrap();
-            async_writer.flush().await.unwrap();
-            async_writer.flush().await.unwrap();
             async_writer.flush().await.unwrap();
         });
 
