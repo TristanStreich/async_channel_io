@@ -8,9 +8,9 @@
 [crates-badge]: https://img.shields.io/crates/v/async_channel_io.svg
 [crates-url]: https://crates.io/crates/async_channel_io
 [mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
-[mit-url]: https://github.com/TristanStreich/channel_io/blob/main/LICENSE
-[actions-badge]: https://github.com/TristanStreich/channel_io/workflows/CI/badge.svg
-[actions-url]: https://github.com/TristanStreich/channel_io/actions?query=branch%3Amain++
+[mit-url]: https://github.com/TristanStreich/async_channel_io/blob/main/LICENSE
+[actions-badge]: https://github.com/TristanStreich/async_channel_io/workflows/CI/badge.svg
+[actions-url]: https://github.com/TristanStreich/async_channel_io/actions?query=branch%3Amain++
 
 Wrappers around [`async_channel`] [`Sender`] and [`Receiver`] which implement [`AsyncRead`] and [`AsyncWrite`]
 
@@ -26,7 +26,7 @@ Wrappers around [`async_channel`] [`Sender`] and [`Receiver`] which implement [`
 
 ```rust
 use tokio::time;
-use channel_io::ChannelWriter;
+use async_channel_io::ChannelWriter;
 use futures::AsyncWriteExt;
 
 async fn example() {
@@ -54,7 +54,7 @@ async fn example() {
 ### Reader
 ```rust
 use tokio::time;
-use channel_io::ChannelReader;
+use async_channel_io::ChannelReader;
 use futures::AsyncReadExt;
 
 async fn example() {
