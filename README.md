@@ -1,4 +1,16 @@
-# channel_io
+# async_channel_io
+
+
+[![Crates.io][crates-badge]][crates-url]
+[![MIT licensed][mit-badge]][mit-url]
+[![Build Status][actions-badge]][actions-url]
+
+[crates-badge]: https://img.shields.io/crates/v/async_channel_io.svg
+[crates-url]: https://crates.io/crates/async_channel_io
+[mit-badge]: https://img.shields.io/badge/license-MIT-blue.svg
+[mit-url]: https://github.com/TristanStreich/channel_io/blob/main/LICENSE
+[actions-badge]: https://github.com/TristanStreich/channel_io/workflows/CI/badge.svg
+[actions-url]: https://github.com/TristanStreich/channel_io/actions?query=branch%3Amain++
 
 Wrappers around [`async_channel`] [`Sender`] and [`Receiver`] which implement [`AsyncRead`] and [`AsyncWrite`]
 
