@@ -1,4 +1,7 @@
+#![doc = include_str!("../README.md")]
 use async_channel::{Receiver, Recv, Send, Sender};
+
+pub use async_channel;
 
 use futures::{
     io::{AsyncRead, AsyncWrite},
@@ -6,11 +9,16 @@ use futures::{
 };
 use std::{cmp::Ordering, io::Write, pin::Pin, task::Poll};
 
+/// Create a reader/writer pair which data will flow through
 pub fn pipe() -> (ChannelWriter, ChannelReader) {
     let (sender, recv) = async_channel::unbounded();
     (ChannelWriter::new(sender), ChannelReader::new(recv))
 }
 
+/// Wrapper around [`async_channel::Sender`] which implements [`AsyncWrite`]
+///
+/// [`async_channel::Sender`]: https://docs.rs/async-channel/latest/async_channel/struct.Sender.html
+/// [`AsyncWrite`]: https://docs.rs/futures/latest/futures/io/trait.AsyncWrite.html
 pub struct ChannelWriter {
     channel: Pin<Box<Sender<Vec<u8>>>>,
     fut: Option<Pin<Box<Send<'static, Vec<u8>>>>>,
@@ -31,12 +39,9 @@ impl AsyncWrite for ChannelWriter {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        log::trace!("Polling Write");
         if let Some(mut fut) = self.fut.take() {
-            log::trace!("Previous Send Found");
             // If the future is still pending then we cannot accept more data
             let Poll::Ready(send_res) = fut.poll_unpin(cx) else {
-                log::trace!("Previous Send Still pending");
                 self.fut = Some(fut);
                 return Poll::Pending;
             };
@@ -66,7 +71,6 @@ impl AsyncWrite for ChannelWriter {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        log::trace!("Polling Flush");
         self.fut
             .as_mut()
             // if there is a future we need to poll it to try and keep writing
@@ -81,11 +85,14 @@ impl AsyncWrite for ChannelWriter {
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        log::trace!("Polling Close");
         std::task::Poll::Ready(Ok(()))
     }
 }
 
+/// Wrapper around [`async_channel::Receiver`] which implements [`AsyncRead`]
+///
+/// [`async_channel::Receiver`]: https://docs.rs/async-channel/latest/async_channel/struct.Receiver.html
+/// [`AsyncRead`]: https://docs.rs/futures/latest/futures/io/trait.AsyncRead.html
 pub struct ChannelReader {
     recv: Pin<Box<Receiver<Vec<u8>>>>,
     data: ChannelReaderData,
@@ -97,7 +104,10 @@ enum ChannelReaderData {
     /// We have data to give but nobody as asked for it yet.
     /// This will happen if we receive a value from pending but
     /// The buffer we write to is not long enough to receive it all
-    Some(Vec<u8>),
+    Some {
+        to_write: Vec<u8>,
+        amount_written: usize,
+    },
     /// We have asked for data and are waiting for a response
     Pending(Pin<Box<Recv<'static, Vec<u8>>>>),
 }
@@ -116,26 +126,31 @@ impl ChannelReader {
         }
     }
 
-    fn try_write(&mut self, mut to_write: Vec<u8>, mut buf: &mut [u8]) -> std::io::Result<usize> {
-        let amount_written = buf.write(&to_write)?;
-        log::trace!("Read {amount_written} bytes");
+    fn try_write(
+        &mut self,
+        to_write: Vec<u8>,
+        mut amount_written: usize,
+        mut buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        let this_amount_written = buf.write(&to_write[amount_written..])?;
+        amount_written += this_amount_written;
+        log::trace!("Read {this_amount_written} bytes");
         match amount_written.cmp(&to_write.len()) {
             // We read everything from the vec into the buffer
             // We can now set self.data to None
             Ordering::Equal => self.data = ChannelReaderData::None,
             // We filled the buffer but did not read all of vec
             Ordering::Less => {
-                // FIXME: this drain copies all elements. Might be a botleneck
-                // consider vecdeque over vec for this impl
-                // another option is to store a counter of amount written and slice &to_write with it (probably most performant?)
-                to_write.drain(0..amount_written);
-                self.data = ChannelReaderData::Some(to_write);
+                self.data = ChannelReaderData::Some {
+                    to_write,
+                    amount_written,
+                }
             }
             Ordering::Greater => {
                 unreachable!("Somehow we read more data from the vector than the vector contains!")
             }
         }
-        Ok(amount_written)
+        Ok(this_amount_written)
     }
 }
 
@@ -147,13 +162,14 @@ impl AsyncRead for ChannelReader {
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        log::trace!("Polling read");
         let mut fut = match self.data.take() {
-            ChannelReaderData::Some(data) => {
+            ChannelReaderData::Some {
+                to_write,
+                amount_written,
+            } => {
                 // here we will read as much as we can to buffer and
                 // then either set data to remaining data or none
-                log::trace!("Data Already Here");
-                return Poll::Ready(self.try_write(data, buf));
+                return Poll::Ready(self.try_write(to_write, amount_written, buf));
             }
             ChannelReaderData::None => {
                 // Time to ask for more data from the channel
@@ -162,7 +178,6 @@ impl AsyncRead for ChannelReader {
                 // but in reality this holds a reference to self.recv so as long we don't
                 // leak fut or recv this "'static" should be valid.
                 // must make sure we have self.recv pinned so the memory reference is valid
-                log::trace!("Making New Recv future");
                 let fut: Recv<'static, Vec<u8>> = unsafe { std::mem::transmute(self.recv.recv()) };
                 Box::pin(fut)
             }
@@ -172,7 +187,6 @@ impl AsyncRead for ChannelReader {
         let received_result = match fut.poll_unpin(cx) {
             Poll::Pending => {
                 self.data = ChannelReaderData::Pending(fut);
-                log::trace!("Receiver is still pending");
                 return Poll::Pending;
             }
             Poll::Ready(bytes) => bytes,
@@ -185,9 +199,7 @@ impl AsyncRead for ChannelReader {
             return Poll::Ready(Ok(0));
         };
 
-        log::trace!("Received {} bytes", bytes.len());
-
-        Poll::Ready(self.try_write(bytes, buf))
+        Poll::Ready(self.try_write(bytes, 0, buf))
     }
 }
 
